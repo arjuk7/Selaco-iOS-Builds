@@ -1,0 +1,284 @@
+#include "i_metalfx_backend.h"
+#include "i_metalfx_bridge.h"
+#include "i_metalfx_interop.h"
+#include "i_metalfx_retry.h"
+#include <zvulkan/vulkandevice.h>
+#include <zvulkan/vulkanobjects.h>
+#include <atomic>
+#include <memory>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <cmath>
+#import <QuartzCore/QuartzCore.h>
+#include "engineerrors.h"
+#if !__has_feature(objc_arc)
+#error MetalFX backend requires ARC
+#endif
+// One receipt per failure site, renderer-thread only. Keep device logs private.
+extern "C" void SelacoIOSReportLicensedAssetProbe(const char*, const char*);
+static void MetalFXReceipt(unsigned site,const char* reason) {
+    static uint64_t reported=0;
+    if(site>=64 || (reported&(uint64_t(1)<<site)))return;
+    reported|=uint64_t(1)<<site;
+    SelacoIOSReportLicensedAssetProbe("metalfx_backend",reason);
+}
+// Vulkan owns final output/presentation. This separate queue never owns a drawable.
+struct IOSMetalFXBackend {
+    VulkanDevice* vk=nullptr;
+    VkSemaphore ready=VK_NULL_HANDLE,done=VK_NULL_HANDLE;
+    uint64_t value=0,lastInterpolatedFrame=0;
+    bool recreate=false, interpolation=false;
+    IOSMetalFXInterop* interop=nullptr;
+    IOSMetalFXBridge* bridge=nullptr;
+    id<MTLCommandQueue> queue;
+    id<MTLComputePipelineState> crop, influence;
+    id<MTLTexture> color,depth,motion,reactive,influenceUI;
+    uint32_t width=0,height=0,outWidth=0,outHeight=0;
+    // Keep completion-handler storage alive without capturing the C++ owner.
+    std::shared_ptr<std::atomic<bool>> failed=std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<std::atomic<unsigned>> completions=std::make_shared<std::atomic<unsigned>>(0);
+    ~IOSMetalFXBackend() {
+        IOSMetalFXDestroy(bridge); IOSMetalFXInteropDestroy(interop);
+        if(ready) vkDestroySemaphore(vk->device,ready,nullptr);
+        if(done) vkDestroySemaphore(vk->device,done,nullptr);
+    }
+};
+static bool Timeline(VulkanDevice* d,VkSemaphore* out) {
+    VkExportMetalObjectCreateInfoEXT e{};e.sType=VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT;
+    e.exportObjectType=VK_EXPORT_METAL_OBJECT_TYPE_METAL_SHARED_EVENT_BIT_EXT;
+    VkSemaphoreTypeCreateInfo t{};t.sType=VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    t.semaphoreType=VK_SEMAPHORE_TYPE_TIMELINE;t.pNext=&e;
+    VkSemaphoreCreateInfo c{};c.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;c.pNext=&t;
+    return vkCreateSemaphore(d->device,&c,nullptr,out)==VK_SUCCESS;
+}
+static id<MTLTexture> Texture(id<MTLDevice>d,uint32_t w,uint32_t h,MTLPixelFormat f,MTLTextureUsage u){
+    auto td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
+    td.storageMode=MTLStorageModePrivate;td.usage=u|MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;
+    return [d newTextureWithDescriptor:td];
+}
+static bool Readable(id<MTLTexture> texture,MTLPixelFormat format) {
+    return texture && texture.pixelFormat==format && (texture.usage&MTLTextureUsageShaderRead)!=0;
+}
+static IOSMetalFXBackend* Create(VulkanDevice*d,const IOSMetalFXVkFrame&f,bool interpolation=false){
+    if(!d->SupportsExtension(VK_EXT_METAL_OBJECTS_EXTENSION_NAME)){MetalFXReceipt(0,"device metal_objects extension unavailable");return nullptr;}
+    if(!d->EnabledFeatures.TimelineSemaphore.timelineSemaphore){MetalFXReceipt(32,"timeline feature unavailable");return nullptr;}
+    auto p=std::make_unique<IOSMetalFXBackend>();p->vk=d;
+    if(!Timeline(d,&p->ready)||!Timeline(d,&p->done)){MetalFXReceipt(1,"timeline semaphore allocation failed");return nullptr;}
+    IOSMetalFXInteropConfig c{};c.device=d->device;c.vulkanQueue=d->GraphicsQueue;
+    c.exportMetalObjects=(PFN_vkExportMetalObjectsEXT)vkGetInstanceProcAddr(d->Instance->Instance,"vkExportMetalObjectsEXT");
+    c.sceneReady=p->ready;c.metalDone=p->done;c.metalObjectsEnabled=true;c.timelineSemaphoreEnabled=true;
+    c.deviceExportDeclaredAtInstanceCreate=true;c.queueExportDeclaredAtInstanceCreate=true;c.semaphoreExportsDeclaredAtCreate=true;
+    c.sceneReadyType=c.metalDoneType=VK_SEMAPHORE_TYPE_TIMELINE;
+    if(IOSMetalFXInteropCreate(c,&p->interop)!=IOSMetalFXInteropStatus::Ready){MetalFXReceipt(2,"Metal object/event export failed");return nullptr;}
+    id<MTLDevice> device=IOSMetalFXInteropDevice(p->interop);p->queue=[device newCommandQueue];
+    p->queue.label=@"Selaco MetalFX interop";
+    IOSMetalFXConfig cfg{};cfg.inputWidth=f.width;cfg.inputHeight=f.height;
+    cfg.outputWidth=f.outputWidth;cfg.outputHeight=f.outputHeight;
+    cfg.colorFormat=cfg.outputFormat=MTLPixelFormatRGBA16Float;
+    cfg.depthFormat=MTLPixelFormatR32Float;cfg.motionFormat=MTLPixelFormatRG16Float;
+    cfg.frameInterpolation=interpolation;cfg.autoExposure=true;
+    cfg.externalInterpolationHistory=interpolation;cfg.reactiveMask=!interpolation;
+    cfg.interpolationColorFormat=cfg.uiFormat=MTLPixelFormatRGBA16Float;
+    p->interpolation=interpolation;
+    if(IOSMetalFXCreate(device,cfg,&p->bridge)!=IOSMetalFXStatus::Ready){MetalFXReceipt(3,"MetalFX scaler/interpolator creation failed");return nullptr;}
+    auto u=IOSMetalFXGetUsage(p->bridge);
+    p->color=Texture(device,f.width,f.height,cfg.colorFormat,u.color);
+    p->depth=Texture(device,f.width,f.height,cfg.depthFormat,u.depth|u.interpolationDepth);
+    p->motion=Texture(device,f.width,f.height,cfg.motionFormat,u.motion|u.interpolationMotion);
+    p->reactive=Texture(device,f.width,f.height,MTLPixelFormatR8Unorm,u.reactive);
+    // Exact low-resolution input textures, including depth-only conversion.
+    NSString* source=@"#include <metal_stdlib>\nusing namespace metal;\n"
+    "kernel void crop(texture2d<float,access::read> c[[texture(0)]],depth2d<float,access::read> d[[texture(1)]],"
+    "texture2d<float,access::read> m[[texture(2)]],texture2d<float,access::write> co[[texture(3)]],"
+    "texture2d<float,access::write> de[[texture(4)]],texture2d<float,access::write> mo[[texture(5)]],"
+    "texture2d<float,access::read> re[[texture(6)]],texture2d<float,access::write> ro[[texture(7)]],"
+    "constant uint2& origin[[buffer(0)]],uint2 p[[thread_position_in_grid]]){"
+    "if(p.x>=co.get_width()||p.y>=co.get_height())return;uint2 q=p+origin;"
+    "co.write(c.read(q),p);de.write(float4(d.read(q),0,0,1),p);mo.write(m.read(q),p);ro.write(re.read(q),p);}"
+    "kernel void cropDM(depth2d<float,access::read> d[[texture(0)]],texture2d<float,access::read> m[[texture(1)]],"
+    "texture2d<float,access::write> de[[texture(2)]],texture2d<float,access::write> mo[[texture(3)]],"
+    "constant uint2& origin[[buffer(0)]],uint2 p[[thread_position_in_grid]]){"
+    "if(p.x>=de.get_width()||p.y>=de.get_height())return;uint2 q=p+origin;"
+    "de.write(float4(d.read(q),0,0,1),p);mo.write(m.read(q),p);}";
+    if(interpolation) source=[source stringByAppendingString:
+        @"kernel void influence(texture2d<float,access::read> clean[[texture(0)]],"
+        "texture2d<float,access::read> full[[texture(1)]],texture2d<float,access::write> ui[[texture(2)]],"
+        "uint2 p[[thread_position_in_grid]]){if(p.x>=ui.get_width()||p.y>=ui.get_height())return;"
+        "bool changed=false;int2 limit=int2(ui.get_width()-1,ui.get_height()-1);"
+        "for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){uint2 q=uint2(clamp(int2(p)+int2(x,y),int2(0),limit));"
+        "float3 a=clean.read(q).rgb,b=full.read(q).rgb;changed=changed||any(a!=b)||any(!isfinite(a))||any(!isfinite(b));}"
+        "float3 value=full.read(p).rgb;ui.write(changed?float4(value,1.0):float4(0.0),p);}"];
+    NSError* error=nil;id<MTLLibrary> lib=[device newLibraryWithSource:source options:nil error:&error];
+    if(lib)p->crop=[device newComputePipelineStateWithFunction:[lib newFunctionWithName:interpolation ? @"cropDM" : @"crop"] error:&error];
+    if(interpolation && lib) {
+        p->influence=[device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"influence"] error:&error];
+        p->influenceUI=Texture(device,f.outputWidth,f.outputHeight,MTLPixelFormatRGBA16Float,u.interpolationUI);
+        if(!p->influence||!p->influenceUI){MetalFXReceipt(4,"influence pipeline allocation failed");return nullptr;}
+    }
+    if(!p->queue||!p->crop||!p->color||!p->depth||!p->motion||!p->reactive){MetalFXReceipt(5,"Metal queue/crop/texture allocation failed");return nullptr;}
+    p->width=f.width;p->height=f.height;p->outWidth=f.outputWidth;p->outHeight=f.outputHeight;
+    return p.release();
+}
+// Failure may occur after scaler allocation or runtime Metal kernel compilation.
+// Keep the ordinary real-frame fallback cheap rather than retrying every frame.
+// Separate mode gates; owner/device/dimensions changes retry immediately.
+static IOSMetalFXBackend* CreateWithBackoff(VulkanDevice*d,const IOSMetalFXVkFrame&f,bool interpolation=false){
+    static IOSMetalFXCreateRetry temporalRetry, interpolationRetry;
+    auto& retry=interpolation?interpolationRetry:temporalRetry;
+    const IOSMetalFXCreateKey key{reinterpret_cast<std::uintptr_t>(d),
+        reinterpret_cast<std::uintptr_t>(d->device),f.width,f.height,f.outputWidth,f.outputHeight,interpolation};
+    if(!retry.Allow(key,IOSMetalFXPresentationTimeNS()))return nullptr;
+    auto* result=Create(d,f,interpolation);
+    if(result)retry.Succeeded();else retry.Failed(IOSMetalFXPresentationTimeNS());
+    return result;
+}
+static bool Submit(VulkanDevice*d,VkSemaphore semaphore,uint64_t value,bool signal){
+    VkTimelineSemaphoreSubmitInfo t{};t.sType=VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    VkSubmitInfo s{};s.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;s.pNext=&t;
+    VkPipelineStageFlags stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if(signal){t.signalSemaphoreValueCount=1;t.pSignalSemaphoreValues=&value;s.signalSemaphoreCount=1;s.pSignalSemaphores=&semaphore;}
+    else{t.waitSemaphoreValueCount=1;t.pWaitSemaphoreValues=&value;s.waitSemaphoreCount=1;s.pWaitSemaphores=&semaphore;s.pWaitDstStageMask=&stage;}
+    return vkQueueSubmit(d->GraphicsQueue,1,&s,VK_NULL_HANDLE)==VK_SUCCESS;
+}
+bool IOSMetalFXBackendConsume(IOSMetalFXBackend*&p,VulkanDevice*d,const IOSMetalFXVkFrame&f){
+    const char* opt=std::getenv("SELACO_IOS_METALFX");
+    if(!opt||std::strcmp(opt,"1")||!f.completeMotion||!d||!f.flushProducer||!f.width||!f.height||
+       !f.outputWidth||!f.outputHeight||!f.color||!f.depth||!f.motion||!f.output||!f.reactive){MetalFXReceipt(8,"temporal inputs invalid");return false;}
+    if(!p)p=CreateWithBackoff(d,f);
+    if(!p||p->vk!=d||p->interpolation||p->failed->load()){MetalFXReceipt(9,"temporal backend unavailable");return false;}
+    if(p->width!=f.width||p->height!=f.height||p->outWidth!=f.outputWidth||p->outHeight!=f.outputHeight){p->recreate=true;{MetalFXReceipt(10,"temporal dimensions changed");return false;}}
+    id<MTLTexture> color=nil,depth=nil,motion=nil,output=nil,reactive=nil;
+    IOSMetalFXExportImage e{};e.textureExportDeclaredAtCreate=true;e.image=f.color;
+    if(IOSMetalFXInteropTexture(p->interop,e,&color)!=IOSMetalFXInteropStatus::Ready){MetalFXReceipt(11,"color export failed");return false;}
+    e.image=VK_NULL_HANDLE;e.imageView=f.depth;e.plane=VK_IMAGE_ASPECT_DEPTH_BIT;
+    if(IOSMetalFXInteropTexture(p->interop,e,&depth)!=IOSMetalFXInteropStatus::Ready){MetalFXReceipt(12,"depth view export failed");return false;}
+    e.imageView=VK_NULL_HANDLE;e.image=f.motion;e.plane=VK_IMAGE_ASPECT_COLOR_BIT;
+    if(IOSMetalFXInteropTexture(p->interop,e,&motion)!=IOSMetalFXInteropStatus::Ready){MetalFXReceipt(13,"motion export failed");return false;}
+    e.image=f.output;if(IOSMetalFXInteropTexture(p->interop,e,&output)!=IOSMetalFXInteropStatus::Ready){MetalFXReceipt(14,"output export failed");return false;}
+    e.image=f.reactive;if(IOSMetalFXInteropTexture(p->interop,e,&reactive)!=IOSMetalFXInteropStatus::Ready){MetalFXReceipt(15,"reactive export failed");return false;}
+    if(!Readable(reactive,MTLPixelFormatR8Unorm)||!Readable(motion,MTLPixelFormatRG16Float)||
+       !Readable(color,MTLPixelFormatRGBA16Float)||(depth.usage&MTLTextureUsageShaderRead)==0||
+       uint64_t(f.x)+f.width>reactive.width||uint64_t(f.y)+f.height>reactive.height){MetalFXReceipt(16,"input format/usage invalid");return false;}
+    if(uint64_t(f.x)+f.width>color.width||uint64_t(f.y)+f.height>color.height||
+       uint64_t(f.x)+f.width>depth.width||uint64_t(f.y)+f.height>depth.height||
+       uint64_t(f.x)+f.width>motion.width||uint64_t(f.y)+f.height>motion.height){MetalFXReceipt(17,"input crop bounds invalid");return false;}
+    auto usage=IOSMetalFXGetUsage(p->bridge);
+    if(output.width!=f.outputWidth||output.height!=f.outputHeight||output.pixelFormat!=MTLPixelFormatRGBA16Float||
+       (output.usage&usage.output)!=usage.output){MetalFXReceipt(18,"output format/usage invalid");return false;}
+    if(p->value==UINT64_MAX){MetalFXReceipt(19,"timeline exhausted");return false;}
+    const uint64_t value=++p->value;
+    id<MTLCommandBuffer> cb=[p->queue commandBuffer];cb.label=@"Selaco temporal upscale";
+    if(IOSMetalFXInteropBegin(p->interop,cb,value)!=IOSMetalFXInteropStatus::Encoded){MetalFXReceipt(20,"temporal interop begin failed");return false;}
+    auto enc=[cb computeCommandEncoder];
+    if(!enc){p->failed->store(true);{MetalFXReceipt(21,"temporal compute encoder failed");return false;}}
+    [enc setComputePipelineState:p->crop];
+    [enc setTexture:color atIndex:0];[enc setTexture:depth atIndex:1];[enc setTexture:motion atIndex:2];
+    [enc setTexture:p->color atIndex:3];[enc setTexture:p->depth atIndex:4];[enc setTexture:p->motion atIndex:5];
+    [enc setTexture:reactive atIndex:6];[enc setTexture:p->reactive atIndex:7];
+    uint32_t origin[2]={f.x,f.y};[enc setBytes:origin length:sizeof(origin) atIndex:0];
+    [enc dispatchThreads:MTLSizeMake(f.width,f.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[enc endEncoding];
+    IOSMetalFXFrame temporal{};temporal.color=p->color;temporal.depth=p->depth;temporal.motion=p->motion;temporal.output=output;temporal.reactive=p->reactive;
+    temporal.jitterX=f.jitterX;temporal.jitterY=f.jitterY;temporal.motionScaleX=float(f.width);temporal.motionScaleY=float(f.height);temporal.reset=f.reset;
+    if(IOSMetalFXEncodeTemporal(p->bridge,cb,temporal)!=IOSMetalFXStatus::Encoded ||
+       IOSMetalFXInteropEnd(p->interop,cb,value)!=IOSMetalFXInteropStatus::Encoded){p->failed->store(true);{MetalFXReceipt(22,"temporal encode/end failed");return false;}}
+    // All failure-prone encoding/preflight happened before submitting the producer.
+    f.flushProducer(f.user);
+    if(!Submit(d,p->ready,value,true)){p->failed->store(true);I_FatalError("MetalFX producer timeline submit failed; unsafe to continue rendering");}
+    auto failed=p->failed;
+    auto completions=p->completions;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> completed){
+        if(completed.status==MTLCommandBufferStatusCompleted && completions->fetch_add(1)==0)
+            std::fputs("Selaco MetalFX temporal: first GPU completion confirmed\n",stderr);
+        if(completed.status==MTLCommandBufferStatusError){
+            failed->store(true);
+            // The GPU signal may not execute on error. Do not leave the Vulkan
+            // consumer hanging, or host-signal it and present undefined pixels.
+            // Termination is independent of the render thread blocked on fences.
+            std::fputs("MetalFX GPU failure: terminating instead of waiting on an unsignalled timeline\n",stderr);
+            std::abort();
+        }
+    }];
+    [cb commit];
+    // A failed Vulkan submit means device loss/error, not a valid fallback frame.
+    if(!Submit(d,p->done,value,false)){p->failed->store(true);I_FatalError("MetalFX consumer timeline submit failed; unsafe to continue rendering");}
+    MetalFXReceipt(31,"temporal submitted; GPU completion and presentation are separate");
+    return true;
+}
+void IOSMetalFXBackendDestroy(IOSMetalFXBackend*p){delete p;}
+
+void IOSMetalFXBackendRetire(IOSMetalFXBackend*&p){if(p && (p->recreate||p->failed->load())){delete p;p=nullptr;}}
+
+bool IOSMetalFXBackendInterpolate(IOSMetalFXBackend*&p,VulkanDevice*d,const IOSMetalFXVkInterpolationFrame&f){
+    const char* opt=std::getenv("SELACO_IOS_METALFX_FRAMEGEN");
+    if(p && (f.reset || !f.previousFrameValid || f.previousFrameId!=p->lastInterpolatedFrame))
+        IOSMetalFXResetInterpolationHistory(p->bridge);
+    if(p && f.reset)p->lastInterpolatedFrame=0;
+    if(!IOSMetalFXRequested()||!opt||std::strcmp(opt,"1")||!f.framegenComplete||!f.completeMotion||
+       !f.cleanScenePair||!f.presentationReserved||!f.previousFrameValid||f.reset||
+       f.previousFrameId==UINT64_MAX||f.currentFrameId!=f.previousFrameId+1||
+       (p && f.currentFrameId<=p->lastInterpolatedFrame)||
+       !d||!f.flushProducer||!f.width||!f.height||!f.outputWidth||!f.outputHeight||
+       !f.color||!f.previousColor||(!f.ui && !f.compositedColor)||!f.depth||!f.motion||!f.output||
+       (f.compositedColor && (!f.matchedComposition || f.ui)))return false;
+    if(!p)p=CreateWithBackoff(d,f,true);
+    if(!p||p->vk!=d||!p->interpolation||p->failed->load())return false;
+    if(p->width!=f.width||p->height!=f.height||p->outWidth!=f.outputWidth||p->outHeight!=f.outputHeight){p->recreate=true;return false;}
+    id<MTLTexture> color=nil,previous=nil,ui=nil,depth=nil,motion=nil,output=nil,composite=nil;
+    IOSMetalFXExportImage e{};e.textureExportDeclaredAtCreate=true;
+    auto exportColor=[&](VkImage image,id<MTLTexture>*out){e.image=image;e.imageView=VK_NULL_HANDLE;e.plane=VK_IMAGE_ASPECT_COLOR_BIT;
+        return IOSMetalFXInteropTexture(p->interop,e,out)==IOSMetalFXInteropStatus::Ready;};
+    if(!exportColor(f.color,&color)||!exportColor(f.previousColor,&previous)||
+       !exportColor(f.motion,&motion)||!exportColor(f.output,&output))return false;
+    if(f.compositedColor) {
+        if(!exportColor(f.compositedColor,&composite)||!Readable(composite,MTLPixelFormatRGBA16Float)||
+           !Readable(color,MTLPixelFormatRGBA16Float)||composite.width!=f.outputWidth||composite.height!=f.outputHeight||
+           color.width!=f.outputWidth||color.height!=f.outputHeight||composite==output||color==output)return false;
+        ui=p->influenceUI;
+    } else if(!exportColor(f.ui,&ui))return false;
+    e.image=VK_NULL_HANDLE;e.imageView=f.depth;e.plane=VK_IMAGE_ASPECT_DEPTH_BIT;
+    if(IOSMetalFXInteropTexture(p->interop,e,&depth)!=IOSMetalFXInteropStatus::Ready)return false;
+    if(!Readable(motion,MTLPixelFormatRG16Float)||(depth.usage&MTLTextureUsageShaderRead)==0||
+       uint64_t(f.x)+f.width>depth.width||uint64_t(f.y)+f.height>depth.height||
+       uint64_t(f.x)+f.width>motion.width||uint64_t(f.y)+f.height>motion.height||p->value==UINT64_MAX)return false;
+    uint64_t value=++p->value;
+    id<MTLCommandBuffer> cb=[p->queue commandBuffer];cb.label=@"Selaco frame interpolation";
+    if(IOSMetalFXInteropBegin(p->interop,cb,value)!=IOSMetalFXInteropStatus::Encoded)return false;
+    auto enc=[cb computeCommandEncoder];if(!enc){p->failed->store(true);return false;}
+    [enc setComputePipelineState:p->crop];[enc setTexture:depth atIndex:0];[enc setTexture:motion atIndex:1];
+    [enc setTexture:p->depth atIndex:2];[enc setTexture:p->motion atIndex:3];
+    uint32_t origin[2]={f.x,f.y};[enc setBytes:origin length:sizeof(origin) atIndex:0];
+    [enc dispatchThreads:MTLSizeMake(f.width,f.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[enc endEncoding];
+    if(composite) {
+        auto overlay=[cb computeCommandEncoder];if(!overlay){p->failed->store(true);return false;}
+        [overlay setComputePipelineState:p->influence];[overlay setTexture:color atIndex:0];
+        [overlay setTexture:composite atIndex:1];[overlay setTexture:ui atIndex:2];
+        [overlay dispatchThreads:MTLSizeMake(f.outputWidth,f.outputHeight,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        [overlay endEncoding];
+    }
+    IOSMetalFXInterpolationFrame frame{};frame.color=color;frame.previousColor=previous;frame.ui=ui;
+    frame.depth=p->depth;frame.motion=p->motion;frame.output=output;frame.previousFrameValid=true;
+    frame.jitterX=f.jitterX;frame.jitterY=f.jitterY;frame.motionScaleX=float(f.width);frame.motionScaleY=float(f.height);
+    frame.deltaTime=f.deltaTime;frame.nearPlane=f.nearPlane;frame.farPlane=f.farPlane;frame.verticalFovDegrees=f.verticalFovDegrees;
+    if(IOSMetalFXEncodeInterpolation(p->bridge,cb,frame)!=IOSMetalFXStatus::Encoded||
+       IOSMetalFXInteropEnd(p->interop,cb,value)!=IOSMetalFXInteropStatus::Encoded){p->failed->store(true);return false;}
+    f.flushProducer(f.user);
+    if(!Submit(d,p->ready,value,true)){p->failed->store(true);I_FatalError("MetalFX framegen producer submit failed");}
+    auto failed=p->failed;
+    auto completions=p->completions;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> completed){
+        if(completed.status==MTLCommandBufferStatusCompleted && completions->fetch_add(1)==0)
+            std::fputs("Selaco MetalFX interpolation: first GPU completion confirmed\n",stderr);
+        if(completed.status==MTLCommandBufferStatusError){failed->store(true);
+            std::fputs("MetalFX framegen GPU failure: terminating instead of waiting on an unsignalled timeline",stderr);std::abort();}
+    }];
+    [cb commit];
+    if(!Submit(d,p->done,value,false)){p->failed->store(true);I_FatalError("MetalFX framegen consumer submit failed");}
+    p->lastInterpolatedFrame=f.currentFrameId;
+    return true;
+}
+
+uint64_t IOSMetalFXPresentationTimeNS() {
+    const double ns=CACurrentMediaTime()*1.0e9;
+    return std::isfinite(ns) && ns>0 && ns<double(UINT64_MAX) ? uint64_t(ns) : 0;
+}

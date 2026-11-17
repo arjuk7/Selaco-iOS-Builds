@@ -1,0 +1,27 @@
+diff --git a/src/maploader/maploader.cpp b/src/maploader/maploader.cpp
+index f1500c42e5a0fba6cd0a2e0b98cd7e2060927a00..d8acccd7af4a11fcc3570408a41d6a8c3f4b019f 100644
+--- a/src/maploader/maploader.cpp
++++ b/src/maploader/maploader.cpp
+@@ -3212,10 +3212,7 @@ void MapLoader::LoadLevel(MapData *map, const char *lumpname, int position)
+ 
+ 	// The owned loader initializes both baked lighting inputs before actors.
+ 	// In particular, LIGHTMAP assigns probe ordinals to converted mapthings.
+-	if (!ForceNodeBuild)
+-	{
+-		LoadLightmap(map);
+-	}
++	LoadLightmap(map);
+ 	LoadLightGroups(map);
+ 	SpawnThings(position);
+ 
+@@ -3419,7 +3416,9 @@ void MapLoader::LoadLightmap(MapData *map)
+ 	Level->LMSourceCompressed = false;
+ 	Level->LPMinX = Level->LPMinY = Level->LPWidth = Level->LPHeight = 0;
+ 	Level->LPCellSize = 32;
+-	if (!map->Size(ML_LIGHTMAP)) return;
++	// Rebuilt nodes invalidate the baked surface mapping. Reset recycled level
++	// state above even on this path, so another map's resources cannot survive.
++	if (ForceNodeBuild || !map->Size(ML_LIGHTMAP)) return;
+ 
+ 	FileReader input;
+ 	if (!OpenDecompressor(input, map->Reader(ML_LIGHTMAP), -1, FileSys::METHOD_ZLIB)) return;

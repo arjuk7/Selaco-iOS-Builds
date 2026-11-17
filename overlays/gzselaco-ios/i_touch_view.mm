@@ -1,0 +1,191 @@
+#import <UIKit/UIKit.h>
+#import <CoreMotion/CoreMotion.h>
+#import <QuartzCore/QuartzCore.h>
+#include "i_touch_input.h"
+#include "i_framegen_compare.h"
+#include "i_touch_math.h"
+#include "i_touch_editor.h"
+#include "i_touch_policy.h"
+#include "i_touch_actions.h"
+#include <cmath>
+static double positions[8][3]={{.66,.31,82},{.78,.18,58},{.89,.29,58},{.78,.39,58},{.92,.09,46},{.55,.09,44},{.65,.09,44},{.73,.09,44}};
+static NSArray* legacyIDs(){return @[@"jump",@"alt",@"reload",@"dash",@"wheel",@"use",@"gyro",@"fire"]; }
+static NSArray* defaultIDs(){return @[@"fire",@"jump",@"dash",@"use_reload",@"wheel",@"gyro",@"melee",@"gadget"];}
+static id copySettings(id x){NSData*d=[NSPropertyListSerialization dataWithPropertyList:x format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];return d?[NSPropertyListSerialization propertyListWithData:d options:NSPropertyListMutableContainersAndLeaves format:NULL error:nil]:nil;}
+static BOOL known(NSString*s){return [s isKindOfClass:NSString.class]&&([@[@"wheel",@"gyro",@"weapons",@"more",@"settings"] containsObject:s]||SelacoIOS::FindTouchAction(s.UTF8String));}
+static NSString* label(NSString*s){if([s isEqual:@"alt"])return @"ALT";if([s isEqual:@"wheel"])return @"WHEEL";if([s isEqual:@"gyro"])return @"GYRO";if([s isEqual:@"weapons"])return @"WEAPONS";if([s isEqual:@"more"])return @"MORE";if([s isEqual:@"settings"])return @"SETTINGS";auto*a=SelacoIOS::FindTouchAction(s.UTF8String);return a?[@(a->label) uppercaseString]:@"?";}
+static NSMutableArray* defaultMenu(){double xy[][2]={{.16,.52},{.16,.8},{.09,.66},{.23,.66},{.86,.58},{.86,.80},{.72,.58},{.72,.8}};NSArray*ids=@[@"menu_up",@"menu_down",@"menu_left",@"menu_right",@"confirm",@"menu_back",@"map",@"codex"];NSMutableArray*a=[NSMutableArray new];for(int i=0;i<8;i++)[a addObject:[@{@"x":@(xy[i][0]),@"y":@(xy[i][1]),@"size":@50,@"opacity":@.8,@"visible":@YES,@"label":@YES,@"action":ids[i]} mutableCopy]];return a;}
+static NSMutableDictionary* defaults(){NSMutableArray*b=[NSMutableArray new];for(int i=0;i<8;i++)[b addObject:[@{@"x":@(positions[i][0]),@"y":@(positions[i][1]),@"size":@(positions[i][2]),@"opacity":@.72,@"visible":@YES,@"label":@YES,@"action":defaultIDs()[i]} mutableCopy]];
+ return [@{@"version":@2,@"layout":b,@"menuLayout":defaultMenu(),@"swipe":@3,@"swipeY":@3,@"gyroGain":@3,@"gyroY":@3,@"gyro":@NO,@"gyroInvertX":@NO,@"gyroInvertY":@NO,@"adsGain":@1,@"fireGain":@1,@"radius":@48,@"deadzone":@.1,@"response":@1,@"moveX":@0,@"moveY":@.12,@"moveW":@.43,@"moveH":@.88,@"lookX":@.43,@"lookY":@0,@"lookW":@.57,@"lookH":@1,@"radialX":@.70,@"radialY":@.48,@"radialSize":@260,@"hold":@.35,
+ @"radial":[@[@"weapons",@"map",@"codex",@"melee",@"gadget",@"crouch",@"more",@"settings"] mutableCopy],@"more":[@[@"objectives",@"meds",@"ability",@"switch_gadget",@"ability_previous",@"ability_next",@"light",@"native_wheel"] mutableCopy]} mutableCopy];}
+@interface SelacoTouchView:UIView {
+ __weak UIViewController *_owner;CMMotionManager *_motion;CADisplayLink *_link;
+ NSMutableDictionary *_settings,*_snapshot,*_touches;NSMutableArray *_layout;UIView *_panel,*_editorBar;UIButton *_editButton,*_fgButton;UILabel *_fpsLabel;double _fpsClock;uint64_t _fpsRendered,_fpsEncoded;UILabel *_editLabel;UISlider *_editSize;
+ UITouch *_moveTouch;CGPoint _origin,_stick,_wheelCenter;bool _menu,_suspended,_editing,_editMenu,_held[512];int _selected,_radial,_sector;
+ SelacoIOS::EditorGesture _editGesture;SelacoIOS::AltLatch _alt;SelacoIOS::LookDoubleTap _lookTap;double _last,_biasX,_biasY,_calUntil,_sumX,_sumY;int _samples;UIInterfaceOrientation _orientation;
+}
+@end
+@implementation SelacoTouchView
+- (instancetype)initWithOwner:(UIViewController*)owner {if((self=[super initWithFrame:owner.view.bounds])){
+ _owner=owner;self.multipleTouchEnabled=YES;self.backgroundColor=UIColor.clearColor;self.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+ _settings=defaults();_touches=[NSMutableDictionary new];_selected=7;_sector=-1;
+ NSDictionary*saved=[NSUserDefaults.standardUserDefaults dictionaryForKey:@"SelacoTouch.v2"]?:[NSUserDefaults.standardUserDefaults dictionaryForKey:@"SelacoTouch.v1"];
+ if([saved isKindOfClass:NSDictionary.class]){for(NSString*k in _settings.allKeys){if([_settings[k] isKindOfClass:NSNumber.class]&&[saved[k] isKindOfClass:NSNumber.class])_settings[k]=saved[k];}
+  if(!saved[@"swipeY"]&&saved[@"swipe"])_settings[@"swipeY"]=saved[@"swipe"];if(!saved[@"gyroY"]&&saved[@"gyroGain"])_settings[@"gyroY"]=saved[@"gyroGain"];
+  if([saved[@"layout"] isKindOfClass:NSArray.class]&&[saved[@"layout"] count]==8)for(int i=0;i<8;i++){id d=saved[@"layout"][i];if(![d isKindOfClass:NSDictionary.class])continue;for(NSString*k in @[@"x",@"y",@"size",@"opacity",@"visible",@"label"])if([d[k] isKindOfClass:NSNumber.class])_settings[@"layout"][i][k]=d[k];if(known(d[@"action"]))_settings[@"layout"][i][@"action"]=d[@"action"];else if(!d[@"action"])_settings[@"layout"][i][@"action"]=legacyIDs()[i];}
+  if([saved[@"menuLayout"] isKindOfClass:NSArray.class]&&[saved[@"menuLayout"] count]==8)for(int i=0;i<8;i++){id d=saved[@"menuLayout"][i];if(![d isKindOfClass:NSDictionary.class])continue;for(NSString*k in @[@"x",@"y",@"size",@"opacity",@"visible",@"label"])if([d[k] isKindOfClass:NSNumber.class])_settings[@"menuLayout"][i][k]=d[k];if(known(d[@"action"]))_settings[@"menuLayout"][i][@"action"]=d[@"action"];}
+  for(NSString*k in @[@"radial",@"more"]){NSArray*a=saved[k];if([a isKindOfClass:NSArray.class]&&a.count==8){BOOL valid=YES;for(id s in a)if(!known(s))valid=NO;if(valid)_settings[k]=[a mutableCopy];}}
+ }
+ // v1 stored positions without action IDs. Decode its original slot semantics first.
+ // Upgrade only the untouched shipped layout; keep every customized layout intact.
+ if(saved){
+  double old[8][3]={{.812,.09,56},{.924,.134,44},{.741,.24,44},{.875,.27,54},{.817,.335,44},{.898,.418,52},{.76,.455,70},{.85,.54,76}};
+  BOOL oldIDs=YES,hybridIDs=[saved[@"version"] intValue]==3,oldGeometry=YES;
+  for(int i=0;i<8;i++){
+   NSDictionary*d=_settings[@"layout"][i];
+   oldIDs=oldIDs&&[d[@"action"] isEqual:legacyIDs()[i]];
+   hybridIDs=hybridIDs&&[d[@"action"] isEqual:defaultIDs()[i]];
+   if(fabs([d[@"x"] doubleValue]-old[i][0])>.00001||fabs([d[@"y"] doubleValue]-old[i][1])>.00001||fabs([d[@"size"] doubleValue]-old[i][2])>.00001||![d[@"visible"] boolValue]||![d[@"label"] boolValue]||fabs([d[@"opacity"] doubleValue]-.72)>.00001)oldGeometry=NO;
+  }
+  // Also repair the exact build26 hybrid: new actions accidentally paired with
+  // all untouched v1 coordinates. Never classify a moved/resized layout as this.
+  if(oldGeometry&&(oldIDs||hybridIDs)){
+   if(![NSUserDefaults.standardUserDefaults objectForKey:@"SelacoTouch.preGlyphBackup"])[NSUserDefaults.standardUserDefaults setObject:saved forKey:@"SelacoTouch.preGlyphBackup"];
+   _settings[@"layout"]=defaults()[@"layout"];
+   NSLog(@"SELACO_TOUCH_LAYOUT migration=%@",hybridIDs?@"build26-hybrid":@"legacy-default");
+  }else NSLog(@"SELACO_TOUCH_LAYOUT migration=preserve-custom");
+ }
+ _settings[@"version"]=@4;_layout=_settings[@"layout"];
+ _motion=[CMMotionManager new];_motion.deviceMotionUpdateInterval=1./120.;_link=[CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];[_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+ [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(suspend:) name:UIApplicationWillResignActiveNotification object:nil];[NSNotificationCenter.defaultCenter addObserver:self selector:@selector(resume:) name:UIApplicationDidBecomeActiveNotification object:nil];
+ UILongPressGestureRecognizer*recovery=[[UILongPressGestureRecognizer alloc]initWithTarget:self action:@selector(recover:)];recovery.numberOfTouchesRequired=3;recovery.minimumPressDuration=1;[self addGestureRecognizer:recovery];
+ _editButton=[UIButton buttonWithType:UIButtonTypeSystem];[_editButton setTitle:@"Edit controls" forState:UIControlStateNormal];_editButton.backgroundColor=[UIColor colorWithWhite:.05 alpha:.8];_editButton.layer.cornerRadius=8;_editButton.accessibilityIdentifier=@"selaco.editControls";[_editButton addTarget:self action:@selector(beginDirectEdit) forControlEvents:UIControlEventTouchUpInside];[self addSubview:_editButton];
+ _fgButton=[UIButton buttonWithType:UIButtonTypeSystem];_fgButton.titleLabel.font=[UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];_fgButton.backgroundColor=[UIColor colorWithWhite:.05 alpha:.8];_fgButton.layer.cornerRadius=8;_fgButton.accessibilityIdentifier=@"selaco.framegenToggle";[_fgButton addTarget:self action:@selector(toggleFramegen) forControlEvents:UIControlEventTouchUpInside];[self addSubview:_fgButton];
+ _fpsLabel=[UILabel new];_fpsLabel.font=[UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];_fpsLabel.textColor=UIColor.whiteColor;_fpsLabel.backgroundColor=[UIColor colorWithWhite:0 alpha:.65];_fpsLabel.numberOfLines=3;_fpsLabel.userInteractionEnabled=NO;_fpsLabel.text=@"Render: measuring\nFG encoded: measuring\nDisplay FPS: unmeasured";[self addSubview:_fpsLabel];
+ [self updateFramegenTitle];
+
+ }return self;}
+// Always discoverable, independent of saved visibility/layout or the radial menu.
+- (void)layoutSubviews{[super layoutSubviews];CGRect a=[self area];_editButton.frame=CGRectMake(a.origin.x+8,a.origin.y+6,116,44);_fgButton.frame=CGRectMake(a.origin.x+132,a.origin.y+6,108,44);_fpsLabel.frame=CGRectMake(a.origin.x+8,a.origin.y+54,225,48);_editorBar.frame=CGRectMake(a.origin.x+8,CGRectGetMaxY(a)-108,fmin(360,a.size.width-16),100);}
+- (void)updateFramegenTitle{const char* launch=std::getenv("SELACO_IOS_METALFX_FRAMEGEN");BOOL available=launch && !std::strcmp(launch,"1");_fgButton.enabled=available;[_fgButton setTitle:!available?@"FG test mode":SelacoCompare::Enabled()?@"FG request: ON":@"FG request: OFF" forState:UIControlStateNormal];_fgButton.accessibilityLabel=@"Toggle experimental frame generation";_fgButton.accessibilityHint=available?@"Compare in the same scene; encoded frames are not displayed FPS":@"Choose temporal plus framegen at launch to compare";}
+- (void)toggleFramegen{SelacoCompare::SetEnabled(!SelacoCompare::Enabled());_fpsClock=0;_fpsLabel.text=@"Render: measuring\nFG encoded: measuring\nDisplay FPS: unmeasured";[self updateFramegenTitle];}
+- (void)sampleFramegen:(double)now{
+ uint64_t r=SelacoCompare::rendered.load(std::memory_order_relaxed),e=SelacoCompare::encoded.load(std::memory_order_relaxed);
+ if(!_fpsClock){_fpsClock=now;_fpsRendered=r;_fpsEncoded=e;return;}
+ double dt=now-_fpsClock;if(dt<1)return;[self updateFramegenTitle];
+ _fpsLabel.text=[NSString stringWithFormat:@"Render: %.1f FPS\nFG encoded: %.1f/s (not displayed)\nDisplay FPS: unmeasured",double(r-_fpsRendered)/dt,double(e-_fpsEncoded)/dt];
+ _fpsClock=now;_fpsRendered=r;_fpsEncoded=e;
+}
+- (void)beginDirectEdit{if(!_snapshot)_snapshot=copySettings(_settings);[self reset];[_panel removeFromSuperview];_panel=nil;_editMenu=_menu;_layout=_settings[_editMenu?@"menuLayout":@"layout"];[self showDirectEditor];}
+- (void)showDirectEditor{[self reset];_editing=true;_editButton.hidden=YES;[_editorBar removeFromSuperview];_editorBar=[UIView new];_editorBar.backgroundColor=[UIColor colorWithWhite:.03 alpha:.95];_editorBar.layer.cornerRadius=10;[self addSubview:_editorBar];
+ _editLabel=[[UILabel alloc]initWithFrame:CGRectMake(8,0,344,24)];_editLabel.font=[UIFont systemFontOfSize:12];_editLabel.textColor=UIColor.whiteColor;[_editorBar addSubview:_editLabel];
+ _editSize=[[UISlider alloc]initWithFrame:CGRectMake(8,24,344,32)];_editSize.minimumValue=44;_editSize.maximumValue=140;_editSize.accessibilityLabel=@"Selected control size";[_editSize addTarget:self action:@selector(resizeSelected:) forControlEvents:UIControlEventValueChanged];[_editorBar addSubview:_editSize];
+ NSArray*names=@[@"Save",@"Cancel",@"Action / more"];
+ for(int i=0;i<3;i++){UIButton*b=[UIButton buttonWithType:UIButtonTypeSystem];b.frame=CGRectMake(8+i*112,56,108,44);[b setTitle:names[i] forState:UIControlStateNormal];b.tag=i;[b addTarget:self action:@selector(editorPressed:) forControlEvents:UIControlEventTouchUpInside];[_editorBar addSubview:b];}
+ [self updateEditorSelection];[self setNeedsLayout];}
+- (void)updateEditorSelection{_editSize.value=[_layout[_selected][@"size"] floatValue];_editLabel.text=[NSString stringWithFormat:@"Drag %@; pinch or slide to resize",label(_layout[_selected][@"action"])];}
+- (void)resizeSelected:(UISlider*)s{_layout[_selected][@"size"]=@(s.value);[self setNeedsDisplay];}
+- (void)editorPressed:(UIButton*)b{[self reset];_editing=false;[_editorBar removeFromSuperview];_editorBar=nil;_editButton.hidden=NO;if(b.tag==2){[self settings];return;}if(b.tag==1&&_snapshot)_settings=_snapshot;_snapshot=nil;_editMenu=false;_layout=_settings[@"layout"];if(b.tag==0)[self save];[self setNeedsDisplay];}
+- (double)n:(NSString*)k fallback:(double)f low:(double)lo high:(double)hi {id o=_settings[k];double v=[o isKindOfClass:NSNumber.class]?[o doubleValue]:f;return std::isfinite(v)?fmax(lo,fmin(hi,v)):f;}
+- (CGRect)area{return UIEdgeInsetsInsetRect(self.bounds,self.safeAreaInsets);}
+- (CGRect)region:(NSString*)prefix {CGRect a=[self area];double x=[self n:[prefix stringByAppendingString:@"X"] fallback:0 low:0 high:.92],y=[self n:[prefix stringByAppendingString:@"Y"] fallback:0 low:0 high:.92],w=[self n:[prefix stringByAppendingString:@"W"] fallback:.43 low:.08 high:1],h=[self n:[prefix stringByAppendingString:@"H"] fallback:1 low:.08 high:1];return CGRectMake(a.origin.x+x*a.size.width,a.origin.y+y*a.size.height,fmin(w,1-x)*a.size.width,fmin(h,1-y)*a.size.height);}
+- (CGPoint)center:(int)i {CGRect a=[self area];return CGPointMake(a.origin.x+fmax(.04,fmin(.96,[_layout[i][@"x"] doubleValue]))*a.size.width,a.origin.y+fmax(.07,fmin(.9,[_layout[i][@"y"] doubleValue]))*a.size.height);}
+- (double)radius:(int)i{return fmax(22.,fmin(70.,[_layout[i][@"size"] doubleValue]*[self area].size.height/400./2.));}
+- (void)save{if(!_snapshot)[NSUserDefaults.standardUserDefaults setObject:_settings forKey:@"SelacoTouch.v2"];}
+- (void)reset{_editGesture.reset();[_touches removeAllObjects];_moveTouch=nil;_radial=0;_sector=-1;_alt.reset();_lookTap.reset();std::fill(std::begin(_held),std::end(_held),false);SelacoTouchReset();[self setNeedsDisplay];}
+- (void)syncKeys{bool wanted[512]{};if(_alt.latched)wanted[0x101]=true;for(id k in _touches){NSDictionary*d=_touches[k];if(![d[@"hold"] boolValue])continue;auto*a=SelacoIOS::FindTouchAction([d[@"action"] UTF8String]);if(a&&a->scanCode>=0&&a->scanCode<512)wanted[a->scanCode]=true;}for(int k=0;k<512;k++)if(wanted[k]!=_held[k]){SelacoTouchKey(k,wanted[k]);_held[k]=wanted[k];}}
+- (void)suspend:(NSNotification*)n{(void)n;_suspended=true;[self reset];[_motion stopDeviceMotionUpdates];}
+- (void)resume:(NSNotification*)n{(void)n;_suspended=false;_last=0;_fpsClock=0;[self reset];}
+- (void)recover:(UILongPressGestureRecognizer*)g{if(g.state==UIGestureRecognizerStateBegan)[self settings];}
+- (void)tick:(CADisplayLink*)link{(void)link;bool menu=SelacoTouchMenu();UIInterfaceOrientation o=self.window.windowScene.interfaceOrientation;
+ if(menu!=_menu||o!=_orientation){[self reset];_menu=menu;_orientation=o;_last=0;_biasX=_biasY=0;}
+ double now=CACurrentMediaTime();[self sampleFramegen:now];double dt=_last?fmin(.05,now-_last):0;_last=now;
+ BOOL active=!_menu&&!_suspended&&!_editing&&!_panel&&!_radial&&[_settings[@"gyro"] boolValue];if(active&&_motion.deviceMotionAvailable&&!_motion.deviceMotionActive)[_motion startDeviceMotionUpdates];if(!active&&_motion.deviceMotionActive)[_motion stopDeviceMotionUpdates];
+ CMDeviceMotion*m=_motion.deviceMotion;if(active&&m&&fabs(NSProcessInfo.processInfo.systemUptime-m.timestamp)<.15){auto a=SelacoIOS::GyroAxes(m.rotationRate.x,m.rotationRate.y,o==UIInterfaceOrientationLandscapeRight,[_settings[@"gyroInvertX"] boolValue],[_settings[@"gyroInvertY"] boolValue]);
+  if(_calUntil>now){_sumX+=a.x;_sumY+=a.y;_samples++;}else{if(_calUntil){if(_samples){_biasX=_sumX/_samples;_biasY=_sumY/_samples;}_calUntil=0;}double ads=(_alt.latched||_held[0x101])?[self n:@"adsGain" fallback:1 low:.1 high:3]:1;SelacoTouchLook((a.x-_biasX)*dt*60*[self n:@"gyroGain" fallback:3 low:.1 high:20]*ads,(a.y-_biasY)*dt*60*[self n:@"gyroY" fallback:3 low:.1 high:20]*ads);}}
+ if(!_editing&&!_menu&&!_panel&&!_radial)for(id k in _touches.allKeys){NSDictionary*d=_touches[k];if([d[@"action"] isEqual:@"wheel"]&&now-[d[@"start"] doubleValue]>[self n:@"hold" fallback:.35 low:.15 high:.8]){[self openRadial:1];break;}}
+ [self setNeedsDisplay];}
+- (void)circle:(CGPoint)c radius:(double)r text:(NSString*)t opacity:(double)alpha selected:(BOOL)selected{UIColor*color=[UIColor colorWithRed:.91 green:.69 blue:.29 alpha:alpha];UIBezierPath*p=[UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x-r,c.y-r,2*r,2*r)];[[UIColor colorWithWhite:0 alpha:selected?.5:.12]setFill];[p fill];[color setStroke];p.lineWidth=selected?2:1;[p stroke];NSDictionary*symbols=@{@"FIRE":@"scope",@"JUMP":@"arrow.up",@"DASH":@"bolt.fill",@"USE / RELOAD":@"arrow.triangle.2.circlepath",@"WHEEL":@"circle.grid.3x3.fill",@"GYRO ON":@"gyroscope",@"GYRO OFF":@"gyroscope",@"MELEE":@"hand.raised.fill",@"USE GADGET":@"cube.fill",@"ALT":@"viewfinder",@"ALT LOCK":@"viewfinder",@"USE":@"hand.point.up.left.fill",@"RELOAD":@"arrow.clockwise",@"MAP":@"map",@"CODEX":@"book.closed",@"CANCEL":@"xmark",@"SETUP":@"gearshape",@"UP":@"chevron.up",@"DOWN":@"chevron.down",@"LEFT":@"chevron.left",@"RIGHT":@"chevron.right",@"CONFIRM":@"checkmark",@"BACK / CLOSE":@"arrow.uturn.backward"};NSString*symbol=symbols[t];if(symbol){UIImage*icon=[UIImage systemImageNamed:symbol withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:r*.88 weight:UIImageSymbolWeightSemibold]];if(icon){icon=[icon imageWithTintColor:color renderingMode:UIImageRenderingModeAlwaysOriginal];CGSize z=icon.size;double scale=fmin(r*1.12/z.width,r*1.12/z.height);[icon drawInRect:CGRectMake(c.x-z.width*scale/2,c.y-z.height*scale/2,z.width*scale,z.height*scale)];return;}}NSDictionary*at=@{NSForegroundColorAttributeName:color,NSFontAttributeName:[UIFont systemFontOfSize:10 weight:UIFontWeightSemibold]};CGSize size=[t sizeWithAttributes:at];[t drawAtPoint:CGPointMake(c.x-size.width/2,c.y-size.height/2) withAttributes:at];}
+- (NSArray*)radialItems{if(_radial==2)return @[@"weapon_1",@"weapon_2",@"weapon_3",@"weapon_4",@"weapon_5",@"weapon_6",@"weapon_7",@"weapon_8",@"weapon_9",@"weapon_0"];return _settings[_radial==3?@"more":@"radial"];}
+- (double)radialRadius{return fmin([self n:@"radialSize" fallback:260 low:200 high:360]/2.,fmin([self area].size.width,[self area].size.height)/2.-12);}
+- (void)openRadial:(int)kind{_radial=kind;_sector=-1;CGRect a=[self area];double r=[self radialRadius]+6;_wheelCenter=CGPointMake(fmax(a.origin.x+r,fmin(CGRectGetMaxX(a)-r,a.origin.x+a.size.width*[self n:@"radialX" fallback:.7 low:0 high:1])),fmax(a.origin.y+r,fmin(CGRectGetMaxY(a)-r,a.origin.y+a.size.height*[self n:@"radialY" fallback:.48 low:0 high:1])));_alt.reset();for(id k in _touches)_touches[k][@"hold"]=@NO;[self syncKeys];SelacoTouchMove(0,0);}
+- (void)drawRect:(CGRect)rect{(void)rect;
+ if(_radial){[[UIColor colorWithWhite:0 alpha:.55]setFill];UIRectFill(self.bounds);NSArray*items=[self radialItems];double r=[self radialRadius],inner=32,step=2*M_PI/items.count;
+  for(NSUInteger i=0;i<items.count;i++){double start=-M_PI_2+(i-.5)*step+.025,end=start+step-.05;UIBezierPath*p=[UIBezierPath bezierPath];[p addArcWithCenter:_wheelCenter radius:r startAngle:start endAngle:end clockwise:YES];[p addArcWithCenter:_wheelCenter radius:inner startAngle:end endAngle:start clockwise:NO];[p closePath];[(_sector==(int)i?[UIColor colorWithRed:.5 green:.34 blue:.08 alpha:.95]:[UIColor colorWithWhite:.08 alpha:.94])setFill];[p fill];[[UIColor colorWithRed:.91 green:.69 blue:.29 alpha:.8]setStroke];p.lineWidth=1;[p stroke];double angle=-M_PI_2+i*step;CGPoint c=CGPointMake(_wheelCenter.x+(.64*r)*cos(angle),_wheelCenter.y+(.64*r)*sin(angle));NSString*t=label(items[i]);NSDictionary*at=@{NSForegroundColorAttributeName:UIColor.whiteColor,NSFontAttributeName:[UIFont systemFontOfSize:10 weight:UIFontWeightSemibold],NSParagraphStyleAttributeName:({NSMutableParagraphStyle*q=[NSMutableParagraphStyle new];q.alignment=NSTextAlignmentCenter;q;})};[t drawInRect:CGRectMake(c.x-41,c.y-14,82,30) withAttributes:at];}
+  [self circle:_wheelCenter radius:inner text:@"CANCEL" opacity:.9 selected:NO];return;}
+ if(_menu&&!_editing){NSMutableArray*game=_layout;_layout=_settings[@"menuLayout"];for(int i=0;i<8;i++){if(![_layout[i][@"visible"] boolValue])continue;[self circle:[self center:i] radius:[self radius:i] text:[_layout[i][@"label"] boolValue]?label(_layout[i][@"action"]):@"" opacity:[_layout[i][@"opacity"] doubleValue] selected:NO];}_layout=game;return;}
+ for(int i=0;i<8;i++){if(![_layout[i][@"visible"] boolValue]&&!_editing)continue;NSString*id=_layout[i][@"action"],*t=label(id);if([id isEqual:@"gyro"])t=[_settings[@"gyro"] boolValue]?@"GYRO ON":@"GYRO OFF";if([id isEqual:@"alt"]&&_alt.latched)t=@"ALT LOCK";if(![_layout[i][@"label"] boolValue]&&!_editing)t=@"";[self circle:[self center:i] radius:[self radius:i] text:t opacity:fmax(.15,fmin(1.,[_layout[i][@"opacity"] doubleValue])) selected:(_editing&&i==_selected)||([id isEqual:@"alt"]&&_alt.latched)];}
+ if(_moveTouch){[self circle:_origin radius:[self n:@"radius" fallback:48 low:28 high:90] text:@"" opacity:.45 selected:NO];[self circle:_stick radius:17 text:@"" opacity:.6 selected:NO];}
+ if(_editing){[[UIColor colorWithRed:0 green:.5 blue:1 alpha:.15]setFill];UIRectFill([self region:@"move"]);[[UIColor colorWithRed:0 green:1 blue:.5 alpha:.12]setFill];UIRectFill([self region:@"look"]);}}
+- (int)button:(CGPoint)p{for(int i=7;i>=0;i--){if(![_layout[i][@"visible"] boolValue]&&!_editing)continue;CGPoint c=[self center:i];if(hypot(p.x-c.x,p.y-c.y)<[self radius:i]+4)return i;}return -1;}
+- (void)activate:(NSString*)id{if([id isEqual:@"settings"]){[self settings];return;}if([id isEqual:@"weapons"]){[self openRadial:2];return;}if([id isEqual:@"more"]){[self openRadial:3];return;}if([id isEqual:@"wheel"]){[self openRadial:1];return;}if([id isEqual:@"gyro"]){_settings[@"gyro"]=@(![_settings[@"gyro"] boolValue]);[self save];return;}auto*a=SelacoIOS::FindTouchAction(id.UTF8String);if(a)SelacoTouchPulse(a->scanCode);}
+- (void)editorTouchesBegan:(NSSet<UITouch*>*)ts{
+ // Find a button first even if UIKit supplies the simultaneous pair unordered.
+ if(!_editGesture.first&&!_editGesture.draining)for(UITouch*t in ts){CGPoint p=[t locationInView:self];int hit=[self button:p];if(hit>=0){_editGesture.begin((uintptr_t)(__bridge void*)t,p.x,p.y,hit,[_layout[hit][@"size"] doubleValue]);_selected=hit;[self updateEditorSelection];break;}}
+ for(UITouch*t in ts){CGPoint p=[t locationInView:self];_editGesture.begin((uintptr_t)(__bridge void*)t,p.x,p.y,-1,0);}
+}
+- (void)editorTouchesMoved:(NSSet<UITouch*>*)ts{
+ for(UITouch*t in ts){CGPoint p=[t locationInView:self];auto change=_editGesture.move((uintptr_t)(__bridge void*)t,p.x,p.y);int i=_editGesture.control;if(i<0)continue;
+  if(change==SelacoIOS::EditorGesture::Change::Resize){_layout[i][@"size"]=@(_editGesture.size);[self updateEditorSelection];}
+  else if(change==SelacoIOS::EditorGesture::Change::Drag){CGRect a=[self area];if(a.size.width>0&&a.size.height>0){_layout[i][@"x"]=@(fmax(.04,fmin(.96,(p.x-a.origin.x)/a.size.width)));_layout[i][@"y"]=@(fmax(.07,fmin(.9,(p.y-a.origin.y)/a.size.height)));}}
+ }[self setNeedsDisplay];
+}
+- (void)touchesBegan:(NSSet<UITouch*>*)ts withEvent:(UIEvent*)event{(void)event;if(_suspended||_panel)return;if(_editing){[self editorTouchesBegan:ts];return;}for(UITouch*t in ts){CGPoint p=[t locationInView:self];NSValue*k=[NSValue valueWithNonretainedObject:t];
+ if(_menu&&!_editing){NSMutableArray*game=_layout;_layout=_settings[@"menuLayout"];int i=[self button:p];NSString*action=i>=0?_layout[i][@"action"]:nil;_layout=game;if(action)[self activate:action];else _touches[k]=[@{@"role":@(-6),@"action":@"",@"last":[NSValue valueWithCGPoint:p],@"start":@(CACurrentMediaTime()),@"travel":@0} mutableCopy];continue;}
+ int role=_radial?-5:[self button:p];NSString*action=role>=0?_layout[role][@"action"]:@"";BOOL hold=NO;
+ if(_editing){if(role<0)continue;_selected=role;[self updateEditorSelection];}
+ else if(role>=0){auto*ac=SelacoIOS::FindTouchAction(action.UTF8String);if([action isEqual:@"alt"])hold=_alt.press(CACurrentMediaTime());else if(ac){hold=ac->mode==SelacoIOS::TouchActionMode::Hold;if(!hold)SelacoTouchPulse(ac->scanCode);}}
+ else if(role!=-5&&CGRectContainsPoint([self region:@"move"],p)&&!_moveTouch){role=-4;_moveTouch=t;_origin=_stick=p;}
+ else if(role!=-5){if(!CGRectContainsPoint([self region:@"look"],p))continue;role=-3;}
+ _touches[k]=[@{@"role":@(role),@"action":action,@"hold":@(hold),@"last":[NSValue valueWithCGPoint:p],@"start":@(CACurrentMediaTime()),@"travel":@0} mutableCopy];}[self syncKeys];}
+- (void)touchesMoved:(NSSet<UITouch*>*)ts withEvent:(UIEvent*)event{(void)event;if(_editing){[self editorTouchesMoved:ts];return;}for(UITouch*t in ts){NSMutableDictionary*d=_touches[[NSValue valueWithNonretainedObject:t]];if(!d)continue;int role=[d[@"role"] intValue];CGPoint p=[t locationInView:self],last=[d[@"last"] CGPointValue];
+ if(_radial)_sector=SelacoIOS::RadialSector(p.x-_wheelCenter.x,p.y-_wheelCenter.y,32,[self radialRadius],(int)[self radialItems].count);
+ else if(_editing&&role>=0){CGRect a=[self area];_layout[role][@"x"]=@(fmax(.04,fmin(.96,(p.x-a.origin.x)/a.size.width)));_layout[role][@"y"]=@(fmax(.07,fmin(.9,(p.y-a.origin.y)/a.size.height)));}
+ else if(role==-4){double radius=[self n:@"radius" fallback:48 low:28 high:90],x=(p.x-_origin.x)/radius,y=(p.y-_origin.y)/radius,len=hypot(x,y),dead=[self n:@"deadzone" fallback:.1 low:0 high:.4],response=[self n:@"response" fallback:1 low:.5 high:3];double sx=SelacoIOS::StickAxis(x,len,dead,response),sy=SelacoIOS::StickAxis(y,len,dead,response);_stick=CGPointMake(_origin.x+sx*radius,_origin.y+sy*radius);SelacoTouchMove(-sy,-sx);}
+ else if(role==-3||[d[@"action"] isEqual:@"fire"]){double gain=(_alt.latched||_held[0x101])?[self n:@"adsGain" fallback:1 low:.1 high:3]:1;if([d[@"action"] isEqual:@"fire"])gain*=[self n:@"fireGain" fallback:1 low:.1 high:3];SelacoTouchLook((p.x-last.x)*[self n:@"swipe" fallback:3 low:.25 high:12]*gain,(p.y-last.y)*[self n:@"swipeY" fallback:3 low:.25 high:12]*gain);}
+ d[@"travel"]=@([d[@"travel"] doubleValue]+hypot(p.x-last.x,p.y-last.y));d[@"last"]=[NSValue valueWithCGPoint:p];}}
+- (void)touchesEnded:(NSSet<UITouch*>*)ts withEvent:(UIEvent*)event{(void)event;if(_editing){for(UITouch*t in ts)_editGesture.end((uintptr_t)(__bridge void*)t);return;}for(UITouch*t in ts){NSValue*k=[NSValue valueWithNonretainedObject:t];NSDictionary*d=_touches[k];if(!d)continue;int role=[d[@"role"] intValue];NSString*id=d[@"action"];CGPoint p=[t locationInView:self];
+ if(role==-6){if(_menu&&[d[@"travel"] doubleValue]<12&&self.bounds.size.width>0&&self.bounds.size.height>0)SelacoTouchMenuTap(p.x/self.bounds.size.width,p.y/self.bounds.size.height);[_touches removeObjectForKey:k];continue;}
+ if(!_editing){if(role==-3&&!_radial&&_lookTap.release(CACurrentMediaTime(),CACurrentMediaTime()-[d[@"start"] doubleValue],[d[@"travel"] doubleValue],p.x,p.y))_alt.latched=!_alt.latched;if([id isEqual:@"alt"])_alt.release(CACurrentMediaTime());if(role==-4){_moveTouch=nil;SelacoTouchMove(0,0);}if(_radial&&([id isEqual:@"wheel"]||role==-5)){NSArray*items=[self radialItems];int sector=SelacoIOS::RadialSector(p.x-_wheelCenter.x,p.y-_wheelCenter.y,32,[self radialRadius],(int)items.count);_radial=0;if(sector>=0)[self activate:items[sector]];}else if(role>=0&&[self button:p]==role){if([id isEqual:@"wheel"])SelacoTouchPulse(0x198);else if([@[@"gyro",@"settings",@"weapons",@"more"] containsObject:id])[self activate:id];}}
+ [_touches removeObjectForKey:k];}[self syncKeys];}
+- (void)touchesCancelled:(NSSet<UITouch*>*)ts withEvent:(UIEvent*)event{(void)ts;(void)event;[self reset];}
+- (UIButton*)option:(NSString*)title action:(NSString*)action y:(CGFloat)y{UIButton*b=[UIButton buttonWithType:UIButtonTypeSystem];b.frame=CGRectMake(12,y,320,34);b.titleLabel.font=[UIFont systemFontOfSize:13];[b setTitle:title forState:UIControlStateNormal];b.accessibilityIdentifier=action;[b addTarget:self action:@selector(optionPressed:) forControlEvents:UIControlEventTouchUpInside];[_panel addSubview:b];return b;}
+- (void)slider:(NSString*)title key:(NSString*)key y:(CGFloat)y low:(float)lo high:(float)hi value:(float)value{UILabel*l=[[UILabel alloc]initWithFrame:CGRectMake(12,y,320,18)];l.text=title;l.textColor=UIColor.whiteColor;l.font=[UIFont systemFontOfSize:11];[_panel addSubview:l];UISlider*s=[[UISlider alloc]initWithFrame:CGRectMake(12,y+18,320,26)];s.minimumValue=lo;s.maximumValue=hi;s.value=value;s.accessibilityIdentifier=key;[s addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];[_panel addSubview:s];}
+- (void)settings{[_editorBar removeFromSuperview];_editorBar=nil;_editButton.hidden=YES;if(!_snapshot)_snapshot=copySettings(_settings);[self reset];_editing=false;[_panel removeFromSuperview];_panel=[[UIScrollView alloc]initWithFrame:CGRectMake(0,0,344,fmin(430,self.bounds.size.height-12))];_panel.center=CGPointMake(self.bounds.size.width/2,self.bounds.size.height/2);_panel.backgroundColor=[UIColor colorWithWhite:.035 alpha:.98];_panel.layer.cornerRadius=12;[self addSubview:_panel];CGFloat y=4;
+ [self option:@"Apply changes" action:@"apply" y:y];y+=34;[self option:@"Cancel changes" action:@"cancel" y:y];y+=34;
+ [self option:_editMenu?@"Editing MENU controls (tap for gameplay)":@"Editing GAMEPLAY controls (tap for menu)" action:@"mode" y:y];y+=34;
+ [self option:[NSString stringWithFormat:@"Selected button %d: %@ (tap to cycle)",_selected+1,label(_layout[_selected][@"action"])] action:@"select" y:y];y+=34;
+ [self option:@"Assign selected button action" action:@"bind" y:y];y+=34;[self option:@"Drag buttons / preview regions" action:@"edit" y:y];y+=34;
+ [self option:[NSString stringWithFormat:@"Selected button visible: %@",[_layout[_selected][@"visible"] boolValue]?@"YES":@"NO"] action:@"visible" y:y];y+=34;
+ [self option:[NSString stringWithFormat:@"Selected button label: %@",[_layout[_selected][@"label"] boolValue]?@"YES":@"NO"] action:@"label" y:y];y+=34;
+ [self slider:@"Selected size" key:@"button.size" y:y low:44 high:140 value:[_layout[_selected][@"size"] floatValue]];y+=48;
+ [self slider:@"Selected opacity" key:@"button.opacity" y:y low:.15 high:1 value:[_layout[_selected][@"opacity"] floatValue]];y+=48;
+ NSArray*specs=@[@[@"Swipe X",@"swipe",@.25,@12],@[@"Swipe Y",@"swipeY",@.25,@12],@[@"Gyro X",@"gyroGain",@.1,@20],@[@"Gyro Y",@"gyroY",@.1,@20],@[@"ADS sensitivity multiplier",@"adsGain",@.1,@3],@[@"Fire-drag multiplier",@"fireGain",@.1,@3],@[@"Joystick radius",@"radius",@28,@90],@[@"Joystick deadzone",@"deadzone",@0,@.4],@[@"Joystick response",@"response",@.5,@3],@[@"Move region X",@"moveX",@0,@.92],@[@"Move region Y",@"moveY",@0,@.92],@[@"Move region width",@"moveW",@.08,@1],@[@"Move region height",@"moveH",@.08,@1],@[@"Look region X",@"lookX",@0,@.92],@[@"Look region Y",@"lookY",@0,@.92],@[@"Look region width",@"lookW",@.08,@1],@[@"Look region height",@"lookH",@.08,@1],@[@"Radial X",@"radialX",@0,@1],@[@"Radial Y",@"radialY",@0,@1],@[@"Radial diameter",@"radialSize",@200,@360],@[@"Wheel hold delay",@"hold",@.15,@.8]];
+ for(NSArray*s in specs){[self slider:s[0] key:s[1] y:y low:[s[2] floatValue] high:[s[3] floatValue] value:[_settings[s[1]] floatValue]];y+=48;}
+ for(NSString*k in @[@"gyroInvertX",@"gyroInvertY"]){[self option:[NSString stringWithFormat:@"%@ : %@",k,[_settings[k] boolValue]?@"ON":@"OFF"] action:k y:y];y+=34;}
+ [self option:@"Calibrate gyro (hold still 1 second)" action:@"calibrate" y:y];y+=34;
+ for(NSString*k in @[@"radial",@"more"])for(int i=0;i<8;i++){[self option:[NSString stringWithFormat:@"%@ %d: %@",k,i+1,label(_settings[k][i])] action:[NSString stringWithFormat:@"%@.%d",k,i] y:y];y+=34;}
+ [self option:@"Reset selected button" action:@"resetSelected" y:y];y+=34;[self option:@"Use approved glyph preset (Apply to keep)" action:@"resetAll" y:y];y+=34;[self option:@"Pause / game menu" action:@"pause" y:y];y+=34;
+ UILabel*help=[[UILabel alloc]initWithFrame:CGRectMake(12,y,320,58)];help.numberOfLines=3;help.text=@"Three-finger hold reopens setup if controls are hidden. ALT double tap locks; tap again releases. Menus/background always release.";help.font=[UIFont systemFontOfSize:11];help.textColor=UIColor.lightGrayColor;[_panel addSubview:help];y+=66;((UIScrollView*)_panel).contentSize=CGSizeMake(344,y);
+}
+- (void)sliderChanged:(UISlider*)slider{NSString*k=slider.accessibilityIdentifier;if([k hasPrefix:@"button."])_layout[_selected][[k substringFromIndex:7]]=@(slider.value);else _settings[k]=@(slider.value);[self setNeedsDisplay];}
+- (void)chooseAction:(NSString*)destination{UIAlertController*c=[UIAlertController alertControllerWithTitle:@"Choose action" message:@"Uses Selaco's actual default game bindings. In-game rebinding changes the matching key." preferredStyle:UIAlertControllerStyleActionSheet];NSMutableArray*ids=[@[@"wheel",@"gyro",@"weapons",@"more",@"settings"] mutableCopy];std::size_t count=0;auto*catalog=SelacoIOS::TouchActionCatalog(count);for(std::size_t i=0;i<count;i++)[ids addObject:@(catalog[i].id)];
+ for(NSString*id in ids)[c addAction:[UIAlertAction actionWithTitle:label(id) style:UIAlertActionStyleDefault handler:^(UIAlertAction*a){(void)a;if([destination isEqual:@"bind"])self->_layout[self->_selected][@"action"]=id;else{NSArray*parts=[destination componentsSeparatedByString:@"."];self->_settings[parts[0]][[parts[1] intValue]]=id;}[self settings];}]];
+ [c addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];c.popoverPresentationController.sourceView=_panel;c.popoverPresentationController.sourceRect=_panel.bounds;[_owner presentViewController:c animated:YES completion:nil];}
+- (void)optionPressed:(UIButton*)b{NSString*a=b.accessibilityIdentifier;
+ if([a isEqual:@"bind"]||[a hasPrefix:@"radial."]||[a hasPrefix:@"more."]){[self chooseAction:a];return;}
+ if([a isEqual:@"mode"]){_editMenu=!_editMenu;_layout=_settings[_editMenu?@"menuLayout":@"layout"];[self settings];return;}
+ if([a isEqual:@"select"]){_selected=(_selected+1)%8;[self settings];return;}
+ if([a isEqual:@"visible"]||[a isEqual:@"label"]){_layout[_selected][a]=@(![_layout[_selected][a] boolValue]);[self settings];return;}
+ if([a hasPrefix:@"gyroInvert"]){_settings[a]=@(![_settings[a] boolValue]);_biasX=_biasY=0;[self settings];return;}
+ if([a isEqual:@"resetSelected"]){_layout[_selected]=defaults()[_editMenu?@"menuLayout":@"layout"][_selected];[self settings];return;}
+ if([a isEqual:@"resetAll"]){_settings=defaults();_layout=_settings[_editMenu?@"menuLayout":@"layout"];[self settings];return;}
+ [_panel removeFromSuperview];_panel=nil;_editButton.hidden=NO;[self reset];
+ if([a isEqual:@"apply"]){_editMenu=false;_layout=_settings[@"layout"];_snapshot=nil;[self save];}
+ else if([a isEqual:@"cancel"]){_editMenu=false;_settings=_snapshot?:defaults();_snapshot=nil;_layout=_settings[@"layout"];}
+ else if([a isEqual:@"edit"])[self showDirectEditor];
+ else if([a isEqual:@"calibrate"]){_editMenu=false;_layout=_settings[@"layout"];_settings[@"gyro"]=@YES;_calUntil=CACurrentMediaTime()+1;_sumX=_sumY=0;_samples=0;}
+ else if([a isEqual:@"pause"]){_editMenu=false;_settings=_snapshot?:_settings;_snapshot=nil;_layout=_settings[@"layout"];SelacoTouchPulse(1);}
+}
+@end
+UIView *SelacoCreateTouchView(UIViewController*controller){return [[SelacoTouchView alloc]initWithOwner:controller];}
